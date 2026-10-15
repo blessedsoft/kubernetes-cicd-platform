@@ -1,0 +1,94 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  IMAGE: ${{ secrets.REGISTRY_USERNAME && format('{0}/sec-project', secrets.REGISTRY_USERNAME) || 'sec-project' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install -r requirements-dev.txt
+      - name: Lint and format check
+        run: ruff check . && ruff format --check .
+      - name: Unit tests and coverage gate
+        run: pytest
+      - name: Publish coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+      - name: SAST security gate
+        run: semgrep scan --config p/python --error --severity ERROR .
+      - name: Dependency vulnerability gate
+        run: pip-audit -r requirements.txt --strict
+
+  image:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --tag "$IMAGE:${GITHUB_SHA}" .
+      - name: Container vulnerability gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Log in and push SHA-tagged image
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - if: github.event_name == 'push'
+        run: docker push "$IMAGE:${GITHUB_SHA}"
+
+  staging:
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure cluster
+        run: echo "${{ secrets.KUBE_CONFIG }}" | base64 --decode > "$RUNNER_TEMP/kubeconfig"
+      - name: Deploy to staging
+        env: {KUBECONFIG: ${{ runner.temp }}/kubeconfig}
+        run: bash deploy.sh staging "$IMAGE:${GITHUB_SHA}"
+      - name: Smoke test
+        env: {KUBECONFIG: ${{ runner.temp }}/kubeconfig}
+        run: |
+          kubectl -n staging port-forward service/sec-project 18080:80 >/tmp/port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID' EXIT
+          for i in {1..30}; do curl --fail --silent http://127.0.0.1:18080/healthz && exit 0; sleep 2; done
+          exit 1
+
+  production:
+    if: github.event_name == 'push'
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - run: echo "${{ secrets.KUBE_CONFIG }}" | base64 --decode > "$RUNNER_TEMP/kubeconfig"
+      - name: Deploy to production with rollback
+        env: {KUBECONFIG: ${{ runner.temp }}/kubeconfig}
+        run: bash deploy.sh production "$IMAGE:${GITHUB_SHA}"
